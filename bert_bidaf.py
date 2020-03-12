@@ -5,13 +5,13 @@ Author:
     Timur Reziapov (treziapov@stanford.edu)
 """
 
-import squad.layers
+import layers
 import torch
 import torch.nn as nn
 
 from torch.nn import CrossEntropyLoss
 from transformers import *
-from squad.util import masked_softmax
+from util import masked_softmax
 
 class BertBidaf(nn.Module):
     """Baseline BiDAF model for SQuAD.
@@ -91,6 +91,40 @@ class BertBidaf(nn.Module):
         out = self.out(mod, c_mask)  # 2 tensors, each (batch_size, c_len)
 
         return out
+
+class BertBidafAttention(nn.Module):
+    """Bidirectional attention originally used by BiDAF.
+
+    Bidirectional attention computes attention in two directions:
+    The context attends to the query and the query attends to the context.
+    The output of this layer is the concatenation of [context, c2q_attention,
+    context * c2q_attention, context * q2c_attention]. This concatenation allows
+    the attention vector at each timestep, along with the embeddings from
+    previous layers, to flow through the attention layer to the modeling layer.
+    The output has shape (batch_size, context_len, 8 * hidden_size).
+
+    Args:
+        hidden_size (int): Size of hidden activations.
+        drop_prob (float): Probability of zero-ing out activations.
+    """
+    def __init__(self, hidden_size, drop_prob=0.1):
+        super(BertBidafAttention, self).__init__()
+        self.drop_prob = drop_prob
+        self.att_projection = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, c, c_mask):
+        batch_size, c_len, _ = c.size()
+
+        c_mask = c_mask.view(batch_size, c_len, 1)  # (batch_size, c_len, 1)
+        q_mask = q_mask.view(batch_size, 1, q_len)  # (batch_size, 1, q_len)
+        s1 = masked_softmax(s, q_mask, dim=2)       # (batch_size, c_len, q_len)
+        s2 = masked_softmax(s, c_mask, dim=1)       # (batch_size, c_len, q_len)
+
+
+
+        x = torch.cat([c, a, c * a, c * b], dim=2)  # (bs, c_len, 4 * hid_size)
+
+        return x
 
 class BertBidafOutput(nn.Module):
 
