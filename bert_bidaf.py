@@ -8,6 +8,7 @@ Author:
 import layers
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.nn import CrossEntropyLoss
 from transformers import *
@@ -45,8 +46,8 @@ class BertBidaf(nn.Module):
                                      num_layers=1,
                                      drop_prob=drop_prob)
 
-        # self.att = layers.BiDAFAttention(hidden_size=2 * hidden_size,
-        #                                  drop_prob=drop_prob)
+        self.att = layers.BiDAFAttention(hidden_size=2 * hidden_size,
+                                         drop_prob=drop_prob)
 
         self.mod = layers.RNNEncoder(input_size=2 * hidden_size,
                                      hidden_size=hidden_size,
@@ -84,11 +85,11 @@ class BertBidaf(nn.Module):
 
         c_enc = self.enc(c_emb, c_len)    # (batch_size, c_len, 1 * hidden_size)
 
-        # att = self.att(c_enc, c_mask)    # (batch_size, c_len, 2 * hidden_size)
+        att = self.att(c_enc, c_mask)    # (batch_size, c_len, 2 * hidden_size)
 
         mod = self.mod(c_enc, c_len)        # (batch_size, c_len, 2 * hidden_size)
 
-        out = self.out(mod, c_mask)  # 2 tensors, each (batch_size, c_len)
+        out = self.out(att, mod, c_mask)  # 2 tensors, each (batch_size, c_len)
 
         return out
 
@@ -109,20 +110,26 @@ class BertBidafAttention(nn.Module):
     """
     def __init__(self, hidden_size, drop_prob=0.1):
         super(BertBidafAttention, self).__init__()
+        
         self.drop_prob = drop_prob
-        self.att_projection = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+        self.c_weight = nn.Parameter(torch.zeros(hidden_size, 1))
+        print(f"BerBidafAttention c_weight shape: {self.c_weight.shape}")
+        torch.nn.init.xavier_uniform_(self.c_weight)
+        self.bias = nn.Parameter(torch.zeros(1))
 
     def forward(self, c, c_mask):
         batch_size, c_len, _ = c.size()
 
+        c = F.dropout(c, self.drop_prob, self.training)  # (bs, c_len, hid_size)
+    
+        # Shapes: (batch_size, c_len, q_len)
+        s0 = torch.matmul(c, self.c_weight)
+        s = s0 + self.bias
+
         c_mask = c_mask.view(batch_size, c_len, 1)  # (batch_size, c_len, 1)
-        q_mask = q_mask.view(batch_size, 1, q_len)  # (batch_size, 1, q_len)
-        s1 = masked_softmax(s, q_mask, dim=2)       # (batch_size, c_len, q_len)
         s2 = masked_softmax(s, c_mask, dim=1)       # (batch_size, c_len, q_len)
 
-
-
-        x = torch.cat([c, a, c * a, c * b], dim=2)  # (bs, c_len, 4 * hid_size)
+        x = c  # (bs, c_len, hid_size)
 
         return x
 
@@ -131,6 +138,7 @@ class BertBidafOutput(nn.Module):
     def __init__(self, hidden_size, drop_prob):
         super(BertBidafOutput, self).__init__()
         
+        self.att_linear_1 = nn.Linear(2 * hidden_size, 1)
         self.mod_linear_1 = nn.Linear(2 * hidden_size, 1)
 
         self.rnn = layers.RNNEncoder(input_size=2 * hidden_size,
@@ -138,13 +146,14 @@ class BertBidafOutput(nn.Module):
                                      num_layers=1,
                                      drop_prob=drop_prob)
 
+        self.att_linear_2 = nn.Linear(2 * hidden_size, 1)
         self.mod_linear_2 = nn.Linear(2 * hidden_size, 1)
 
-    def forward(self, mod, mask):
+    def forward(self, att, mod, mask):
         # Shapes: (batch_size, seq_len, 1)
-        logits_1 = self.mod_linear_1(mod)
+        logits_1 = self.att_linear_1(att) + self.mod_linear_1(mod)
         mod_2 = self.rnn(mod, mask.sum(-1))
-        logits_2 = self.mod_linear_2(mod_2)
+        logits_2 = self.att_linear_2(att) + self.mod_linear_2(mod_2)
 
         # Shapes: (batch_size, seq_len)
         log_p1 = masked_softmax(logits_1.squeeze(), mask, log_softmax=True)
@@ -169,6 +178,9 @@ class BertBidafForQuestionAnswering(BertPreTrainedModel):
                                      hidden_size=self.hidden_size,
                                      num_layers=1,
                                      drop_prob=self.drop_prob)
+
+        self.att = BertBidafAttention(hidden_size=2 * self.hidden_size,
+                                      drop_prob=self.drop_prob)
 
         self.mod = layers.RNNEncoder(input_size=2 * self.hidden_size,
                                      hidden_size=self.hidden_size,
@@ -245,8 +257,9 @@ class BertBidafForQuestionAnswering(BertPreTrainedModel):
         c_mask = torch.zeros_like(input_ids) != input_ids
         c_len = c_mask.sum(-1)
         c_enc = self.enc(c_emb, c_len)    # (batch_size, c_len, 1 * hidden_size)
-        mod = self.mod(c_enc, c_len)        # (batch_size, c_len, 2 * hidden_size)
-        start_logits, end_logits = self.out(mod, c_mask)  # 2 tensors, each (batch_size, c_len)
+        att = self.att(c_enc, c_mask)
+        mod = self.mod(att, c_len)        # (batch_size, c_len, 2 * hidden_size)
+        start_logits, end_logits = self.out(att, mod, c_mask)  # 2 tensors, each (batch_size, c_len)
         
         outputs = (start_logits, end_logits,) + outputs[2:]
         if start_positions is not None and end_positions is not None:
